@@ -951,7 +951,10 @@ fn makeConnection(
     return conn;
 }
 
-fn start(port: u16, allocator: std.mem.Allocator) !Connection {
+fn start(
+    allocator: std.mem.Allocator,
+    port: u16,
+) !Connection {
     var input_buff: [1024]u8 = undefined;
     var input_reader = std.fs.File.stdin().reader(&input_buff);
 
@@ -996,8 +999,8 @@ pub fn main() !void {
     const allocator = arena.allocator();
 
     var conn = try start(
-        port,
         allocator,
+        port,
     );
 
     try run(allocator, &conn);
