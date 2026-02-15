@@ -3,6 +3,20 @@ const unchat = @import("unchat");
 const tls = @import("tls");
 const xmpp = unchat.Xmpp;
 
+const Connection = struct {
+    tcp: std.net.Stream,
+    tls: tls.Connection,
+
+    tcp_wbuf: [std.crypto.tls.max_ciphertext_record_len]u8,
+    tcp_rbuf: [std.crypto.tls.max_ciphertext_record_len]u8,
+    tls_wbuf: [tls.max_ciphertext_record_len]u8,
+    tls_rbuf: [tls.max_ciphertext_record_len]u8,
+};
+
+const TTYsettings = struct {
+    tty_file: std.fs.File,
+    old_settings: std.os.linux.termios,
+};
 fn takeMore(reader: *std.Io.Reader) ![]u8 {
     try reader.fillMore();
     const response = try reader.take(reader.bufferedLen());
@@ -95,8 +109,6 @@ fn selectUser(
     var in_buff: [1024]u8 = undefined;
     var in_reader = std.fs.File.stdin().reader(&in_buff);
     const inr = &in_reader.interface;
-    //clear terminal
-    std.debug.print("\x1b[2J\x1b[H", .{});
 
     const symbols = struct {
         pub const arrow = @constCast("->");
@@ -107,6 +119,10 @@ fn selectUser(
     const account_num: u8 = @intCast(account_list.items.len);
     var move: u8 = undefined;
     var sign: []u8 = symbols.arrow;
+
+    //clear terminal
+    std.debug.print("\x1b[2J\x1b[H", .{});
+    const tty_settings = try hide_input();
     while (move != '\n') {
         //clear
         std.debug.print("\x1b[2J\x1b[H", .{});
@@ -125,84 +141,70 @@ fn selectUser(
         };
     }
 
+    try show_input(tty_settings);
     return account_list.items[selected];
-}
-
-fn getConnection(
-    allocator: std.mem.Allocator,
-    hostname: []const u8,
-    reader: *std.net.Stream.Reader,
-    writer: *std.net.Stream.Writer,
-) !tls.Connection {
-    const url = try std.fmt.allocPrint(allocator, "https://{s}", .{hostname});
-    const uri = try std.Uri.parse(url);
-    const host = uri.host.?.percent_encoded;
-
-    var root_ca = try tls.config.cert.fromSystem(allocator);
-    defer root_ca.deinit(allocator);
-
-    return tls.client(reader.interface(), &writer.interface, .{
-        .host = host,
-        .root_ca = root_ca,
-    });
 }
 
 fn saslNegotioation(
     allocator: std.mem.Allocator,
-    conn_reader: *std.Io.Reader,
-    conn_writer: *std.Io.Writer,
-    debug_file_writer: *std.Io.Writer,
+    conn: *tls.Connection,
     username: []const u8,
     hostname: []const u8,
     pass: []const u8,
 ) !void {
     var buf: [1024]u8 = undefined;
     var pass_buf: [1024]u8 = undefined;
+    var tls_rbuf: [tls.max_ciphertext_record_len]u8 = undefined;
+    var tls_wbuf: [tls.max_ciphertext_record_len]u8 = undefined;
+
+    var conn_reader = conn.reader(&tls_rbuf);
+    var conn_writer = conn.writer(&tls_wbuf);
+
     const auth_string = std.base64.standard.Encoder.encode(&buf, try std.fmt.bufPrint(&pass_buf, "\x00{s}\x00{s}", .{ username, pass }));
-    try conn_writer.writeAll(try xmpp.Stanzas.formatAuth(allocator, @constCast(xmpp.AuthMechanism.PLAIN), @constCast(auth_string)));
-    try conn_writer.flush();
+    try conn_writer.interface.writeAll(try xmpp.Stanzas.formatAuth(allocator, @constCast(xmpp.AuthMechanism.PLAIN), @constCast(auth_string)));
+    try conn_writer.interface.flush();
 
     // read response
-    const response = try takeMore(conn_reader);
+    const response = try takeMore(&conn_reader.interface);
     if (std.mem.eql(u8, response[0..xmpp.ResponseErrors.failed_response.len], xmpp.ResponseErrors.failed_response)) {
         std.debug.print("\nfailure!\n{s}", .{response});
         return;
     }
 
-    // read response
-    try debug_file_writer.writeAll(response);
-    try debug_file_writer.flush();
-
     //clear connection reader
-    try conn_reader.discardAll(conn_reader.bufferedLen());
+    try conn_reader.interface.discardAll(conn_reader.interface.bufferedLen());
 
     //restart xmpp stream
-    try conn_writer.writeAll(try xmpp.Stanzas.formatHeader(
+    try conn_writer.interface.writeAll(try xmpp.Stanzas.formatHeader(
         allocator,
         try std.fmt.allocPrint(allocator, "{s}@{s}", .{ username, hostname }),
         @constCast(hostname),
     ));
-    try conn_writer.flush();
+    try conn_writer.interface.flush();
 
     // read response
-    try debug_file_writer.writeAll(try takeMore(conn_reader));
-    try debug_file_writer.flush();
+    _ = try takeMore(&conn_reader.interface);
 }
 
 fn resourceBinding(
     allocator: std.mem.Allocator,
-    conn_writer: *std.Io.Writer,
-    conn_reader: *std.Io.Reader,
+    conn: *tls.Connection,
 ) !void {
+    var tls_rbuf: [tls.max_ciphertext_record_len]u8 = undefined;
+    var tls_wbuf: [tls.max_ciphertext_record_len]u8 = undefined;
+
+    var conn_reader = conn.reader(&tls_rbuf);
+    var conn_writer = conn.writer(&tls_wbuf);
+
     // has 2 components with params iq and its body
-    try conn_writer.writeAll(try xmpp.Stanzas.Iq.formatIq(
+    try conn_writer.interface.writeAll(try xmpp.Stanzas.Iq.formatIq(
         allocator,
         .set,
         try xmpp.Stanzas.Iq.Requests.formatBind(allocator, "unchat"),
     ));
-    try conn_writer.flush();
+    try conn_writer.interface.flush();
     //read responce
-    _ = try takeMore(conn_reader);
+    _ = try takeMore(&conn_reader.interface);
 }
 
 fn findAllAtribute(
@@ -235,9 +237,9 @@ fn getAtributeValue(
     haystack: []const T,
     idx: usize,
 ) []const T {
-    const start = std.mem.indexOfScalarPos(T, haystack, idx, '\'').?;
-    const end = std.mem.indexOfScalarPos(T, haystack, start + 1, '\'').?;
-    return haystack[start + 1 .. end];
+    const strt = std.mem.indexOfScalarPos(T, haystack, idx, '\'').?;
+    const end = std.mem.indexOfScalarPos(T, haystack, strt + 1, '\'').?;
+    return haystack[strt + 1 .. end];
 }
 
 fn getAllAtributeValues(
@@ -329,7 +331,7 @@ fn getTagContent(
             src,
             open_name,
         ) orelse return error.TagNotFound;
-        const start = std.mem.indexOfScalarPos(
+        const strt = std.mem.indexOfScalarPos(
             u8,
             src,
             tag_start + open_name.len,
@@ -339,14 +341,14 @@ fn getTagContent(
         const end = std.mem.indexOfPos(
             u8,
             src,
-            start,
+            strt,
             close_name,
         ) orelse {
-            std.debug.print("{s}", .{src[start..]});
+            std.debug.print("{s}", .{src[strt..]});
             return error.ClosingTagNotFound;
         };
 
-        break :blk src[start + 1 .. end];
+        break :blk src[strt + 1 .. end];
     };
 }
 test getTagContent {
@@ -621,23 +623,25 @@ test readFromLog {
 
 fn run(
     allocator: std.mem.Allocator,
-    conn_reader: *std.Io.Reader,
-    conn_writer: *std.Io.Writer,
-    inr: *std.Io.Reader,
+    conn: *Connection,
 ) !void {
+    var input_buff: [1024]u8 = undefined;
+
+    var conn_reader = conn.tls.reader(&conn.tls_rbuf);
+    var conn_writer = conn.tls.writer(&conn.tls_wbuf);
+    var input_reader = std.fs.File.stdin().reader(&input_buff);
 
     //roster
-    try conn_writer.writeAll(try xmpp.Stanzas.Iq.formatIq(
+    try conn_writer.interface.writeAll(try xmpp.Stanzas.Iq.formatIq(
         allocator,
         .get,
         try xmpp.Stanzas.Iq.Requests.formatQuery(allocator),
     ));
 
-    try conn_writer.writeAll("<presence/>");
+    try conn_writer.interface.writeAll("<presence/>");
+    try conn_writer.interface.flush();
 
-    try conn_writer.flush();
-
-    const roster_src = try takeMore(conn_reader);
+    const roster_src = try takeMore(&conn_reader.interface);
     const user_jid: []const u8 = blk: {
         const idx: usize = std.mem.indexOf(u8, roster_src, "to").?;
         break :blk getAtributeValue(u8, roster_src, idx);
@@ -646,14 +650,7 @@ fn run(
     var roster_jids = try getRosterJids(allocator, roster_src);
     defer roster_jids.deinit(allocator);
 
-    const tty_file = try std.fs.openFileAbsolute("/dev/tty", .{});
-    defer tty_file.close();
-    const tty_fd = tty_file.handle;
-
-    const old_settings = try hide_input(tty_fd);
-
     const chat_jid = try selectUser(&roster_jids);
-    try show_input(tty_fd, old_settings);
 
     const log_file = blk: {
         const log_dir = "log";
@@ -690,7 +687,7 @@ fn run(
     //listen to messages in background
     const listen_thread = try std.Thread.spawn(.{}, listenToMessages, .{
         allocator,
-        conn_reader,
+        &conn_reader.interface,
         &messages,
     });
     listen_thread.detach();
@@ -699,16 +696,16 @@ fn run(
         dysplay(messages);
 
         //clear input reader
-        try inr.discardAll(inr.bufferedLen());
+        try input_reader.interface.discardAll(input_reader.interface.bufferedLen());
         //get text from user
-        const user_message = try inr.takeDelimiterExclusive('\n');
+        const user_message = try input_reader.interface.takeDelimiterExclusive('\n');
 
         if (std.mem.eql(u8, user_message, ":q")) {
             break;
         }
 
         //send message
-        try conn_writer.writeAll(
+        try conn_writer.interface.writeAll(
             try xmpp.Stanzas.Message.formatMessage(
                 allocator,
                 @constCast(user_jid),
@@ -717,7 +714,7 @@ fn run(
                 user_message,
             ),
         );
-        try conn_writer.flush();
+        try conn_writer.interface.flush();
 
         //save a message
         try messages.append(allocator, .{
@@ -731,7 +728,11 @@ fn run(
     try writeToLog(&writer, messages);
 }
 
-fn hide_input(tty_fd: i32) !std.os.linux.termios {
+///set tty settings to hide input
+fn hide_input() !TTYsettings {
+    const tty_file = try std.fs.openFileAbsolute("/dev/tty", .{});
+    const tty_fd = tty_file.handle;
+
     var old_settings: std.os.linux.termios = undefined;
     _ = std.os.linux.tcgetattr(tty_fd, &old_settings);
 
@@ -741,14 +742,20 @@ fn hide_input(tty_fd: i32) !std.os.linux.termios {
 
     _ = std.os.linux.tcsetattr(tty_fd, .NOW, &new_settings);
 
-    return old_settings;
+    return .{
+        .tty_file = tty_file,
+        .old_settings = old_settings,
+    };
 }
 
-fn show_input(tty_fd: i32, old_settings: std.os.linux.termios) !void {
-
-    //return input to the start state
-    _ = std.os.linux.tcsetattr(tty_fd, .NOW, &old_settings);
-    std.debug.print("\n", .{});
+///return input to the start state
+fn show_input(settings: TTYsettings) !void {
+    _ = std.os.linux.tcsetattr(
+        settings.tty_file.handle,
+        .NOW,
+        &settings.old_settings,
+    );
+    settings.tty_file.close();
 }
 
 fn getAccountList(
@@ -767,7 +774,14 @@ fn getAccountList(
     }
 } {
     var res: std.ArrayList([]const u8) = .empty;
-    const config = try getConfigDir(allocator, ".config", "unchat");
+    var config = try getConfigDir(allocator, ".config", "unchat");
+    defer config.close();
+
+    config.access(filepath, .{}) catch |err| switch (err) {
+        error.FileNotFound => try initAccount(allocator),
+        else => return err,
+    };
+
     const src = try config.readFileAlloc(allocator, filepath, 2048);
 
     var lines = std.mem.splitScalar(u8, src, '\n');
@@ -858,6 +872,122 @@ fn initAccount(allocator: std.mem.Allocator) !void {
     try wrt.interface.flush();
 }
 
+fn makeConnection(
+    allocator: std.mem.Allocator,
+    port: u16,
+    hostname: []const u8,
+    username: []const u8,
+    pass: []const u8,
+) !Connection {
+    var conn: Connection = undefined;
+
+    //open tcp connection
+    conn.tcp = try std.net.tcpConnectToHost(allocator, hostname, port);
+
+    //get reader & writer interfaces from tcp connection
+    var tcp_reader = conn.tcp.reader(&conn.tcp_rbuf);
+    var tcp_writer = conn.tcp.writer(&conn.tcp_wbuf);
+
+    //open xmpp stream
+    try tcp_writer.interface.writeAll(try xmpp.Stanzas.formatHeader(allocator, @constCast("me"), @constCast(hostname)));
+    try tcp_writer.interface.flush();
+
+    //read response
+    _ = try takeMore(tcp_reader.interface());
+
+    //start tls negotiation
+    try tcp_writer.interface.writeAll(xmpp.Stanzas.starttls_string);
+    try tcp_writer.interface.flush();
+
+    //read response
+    _ = try takeMore(tcp_reader.interface());
+
+    //establish tls connection
+
+    var tls_reader = conn.tcp.reader(&conn.tls_rbuf);
+    var tls_writer = conn.tcp.writer(&conn.tls_wbuf);
+
+    conn.tls = blk: {
+        const url = try std.fmt.allocPrint(allocator, "https://{s}", .{hostname});
+        const uri = try std.Uri.parse(url);
+        const host = uri.host.?.percent_encoded;
+
+        var root_ca = try tls.config.cert.fromSystem(allocator);
+        defer root_ca.deinit(allocator);
+
+        break :blk try tls.client(tls_reader.interface(), &tls_writer.interface, .{
+            .host = host,
+            .root_ca = root_ca,
+        });
+    };
+
+    //tls connection reader and writer
+    var conn_reader = conn.tls.reader(&conn.tls_rbuf);
+    var conn_writer = conn.tls.writer(&conn.tcp_wbuf);
+
+    //restart xmpp stream
+    try conn_writer.interface.writeAll(try xmpp.Stanzas.formatHeader(
+        allocator,
+        @constCast("me"),
+        @constCast(hostname),
+    ));
+    try conn_writer.interface.flush();
+
+    //read response
+    std.debug.print("{s}", .{try takeMore(&conn_reader.interface)});
+
+    //sasl negotioation (login)
+    try saslNegotioation(
+        allocator,
+        &conn.tls,
+        username,
+        hostname,
+        pass,
+    );
+
+    // resourse binding
+    try resourceBinding(allocator, &conn.tls);
+
+    return conn;
+}
+
+fn start(port: u16, allocator: std.mem.Allocator) !Connection {
+    var input_buff: [1024]u8 = undefined;
+    var input_reader = std.fs.File.stdin().reader(&input_buff);
+
+    const account_file_name: []const u8 = "accounts.md";
+    var account_list = try getAccountList(allocator, account_file_name);
+    defer account_list.deinit();
+
+    const jid = try selectUser(&account_list.list);
+    const at = std.mem.indexOfScalar(u8, jid, '@').?;
+
+    const username = jid[0..at];
+    const hostname = jid[at + 1 ..];
+
+    //enter password
+    std.debug.print("\np:", .{});
+    const tty_settings = try hide_input();
+    const pass = try input_reader.interface.takeDelimiterExclusive('\n');
+    try show_input(tty_settings);
+
+    std.debug.print("Connecting to {s}:{d}...\n", .{ hostname, port });
+
+    const conn = try makeConnection(
+        allocator,
+        port,
+        hostname,
+        username,
+        pass,
+    );
+
+    //clear
+    std.debug.print("\x1b[2J\x1b[H", .{});
+    std.debug.print("\nsuccess!\n", .{});
+
+    return conn;
+}
+
 pub fn main() !void {
     const port = 5222;
 
@@ -865,126 +995,10 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var in_buff: [1024]u8 = undefined;
-    var in_reader = std.fs.File.stdin().reader(&in_buff);
-    const in_r = &in_reader.interface;
-
-    const tty_file = try std.fs.openFileAbsolute("/dev/tty", .{});
-    defer tty_file.close();
-    const tty_fd = tty_file.handle;
-
-    const account_file_name: []const u8 = "accounts.md";
-
-    var config = try getConfigDir(allocator, ".config", "unchat");
-    defer config.close();
-
-    config.access(account_file_name, .{}) catch |err| switch (err) {
-        error.FileNotFound => try initAccount(allocator),
-        else => return err,
-    };
-
-    var account_list = try getAccountList(allocator, account_file_name);
-    defer account_list.deinit();
-
-    const old_settings = try hide_input(tty_fd);
-    const jid = try selectUser(&account_list.list);
-    const at = std.mem.indexOfScalar(u8, jid, '@').?;
-
-    const username = jid[0..at];
-    const hostname = jid[at + 1 ..];
-    //enter password
-    std.debug.print("\np:", .{});
-    const pass = try in_r.takeDelimiterExclusive('\n');
-
-    try show_input(tty_fd, old_settings);
-
-    std.debug.print("Connecting to {s}:{d}...\n", .{ hostname, port });
-
-    //open tcp connection
-    var tcp = try std.net.tcpConnectToHost(allocator, hostname, port);
-    defer tcp.close();
-
-    //get reader & writer interfaces from tcp connection
-    var reader_buf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;
-    var tcp_reader_wraper = tcp.reader(&reader_buf);
-    const tcp_reader: *std.Io.Reader = tcp_reader_wraper.interface();
-    var writer_buf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;
-    var tcp_writer_wraper = tcp.writer(&writer_buf);
-    const tcp_writer: *std.Io.Writer = &tcp_writer_wraper.interface;
-
-    //open debug file
-    const debug_file = try config.createFile("debug.xml", .{ .truncate = true });
-    defer debug_file.close();
-
-    //get debug file writer
-    var debug_file_writer_buf: [1024]u8 = undefined;
-    var debug_file_writer_wraper = debug_file.writer(&debug_file_writer_buf);
-    const debug_file_writer = &debug_file_writer_wraper.interface;
-
-    //open xmpp stream
-    try tcp_writer.writeAll(try xmpp.Stanzas.formatHeader(allocator, @constCast("me"), @constCast(hostname)));
-    try tcp_writer.flush();
-
-    //read response
-    _ = try takeMore(tcp_reader);
-
-    //start tls negotiation
-    try tcp_writer.writeAll(xmpp.Stanzas.starttls_string);
-    try tcp_writer.flush();
-
-    //read response
-    _ = try takeMore(tcp_reader);
-
-    //establish tls connection
-    var tls_input_buf: [tls.input_buffer_len]u8 = undefined;
-    var tls_output_buf: [tls.output_buffer_len]u8 = undefined;
-    var tls_reader = tcp.reader(&tls_input_buf);
-    var tls_writer = tcp.writer(&tls_output_buf);
-
-    var conn: tls.Connection = try getConnection(allocator, hostname, &tls_reader, &tls_writer);
-
-    //tls connection reader and writer
-    var conn_reader_buf: [4056]u8 = undefined;
-    var conn_reader_wrap = conn.reader(&conn_reader_buf);
-    const conn_reader = &conn_reader_wrap.interface;
-    var conn_writer_buf: [4056]u8 = undefined;
-    var conn_writer_wrap = conn.writer(&conn_writer_buf);
-    const conn_writer = &conn_writer_wrap.interface;
-
-    //restart xmpp stream
-    try conn_writer.writeAll(try xmpp.Stanzas.formatHeader(
+    var conn = try start(
+        port,
         allocator,
-        @constCast("me"),
-        @constCast(hostname),
-    ));
-    try conn_writer.flush();
-
-    //read response
-    _ = try takeMore(conn_reader);
-
-    //sasl negotioation (login)
-    try saslNegotioation(
-        allocator,
-        conn_reader,
-        conn_writer,
-        debug_file_writer,
-        username,
-        hostname,
-        pass,
     );
 
-    // resourse binding
-    try resourceBinding(allocator, conn_writer, conn_reader);
-
-    //clear
-    std.debug.print("\x1b[2J\x1b[H", .{});
-    std.debug.print("\nsuccess!\n", .{});
-
-    //////////// chatting
-    try run(
-        allocator,
-        conn_reader,
-        conn_writer,
-        in_r,
-    );
+    try run(allocator, &conn);
 }
