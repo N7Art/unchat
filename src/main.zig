@@ -934,7 +934,7 @@ fn makeConnection(
     try conn_writer.interface.flush();
 
     //read response
-    std.debug.print("{s}", .{try takeMore(&conn_reader.interface)});
+    _ = try takeMore(&conn_reader.interface);
 
     //sasl negotioation (login)
     try saslNegotioation(
