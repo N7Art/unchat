@@ -103,37 +103,35 @@ test dysplay {
     dysplay(msgs);
 }
 
-fn selectUser(
-    account_list: *std.ArrayList([]const u8),
+fn selectFromList(
+    list: *std.ArrayList([]const u8),
+    input: *std.Io.Reader,
+    output: *std.Io.Writer,
 ) ![]const u8 {
-    var in_buff: [1024]u8 = undefined;
-    var in_reader = std.fs.File.stdin().reader(&in_buff);
-    const inr = &in_reader.interface;
-
     const symbols = struct {
         pub const arrow = @constCast("->");
         pub const empty = @constCast("  ");
     };
 
     var selected: u8 = 0;
-    const account_num: u8 = @intCast(account_list.items.len);
+    const account_num: u8 = @intCast(list.items.len);
     var move: u8 = undefined;
     var sign: []u8 = symbols.arrow;
 
-    //clear terminal
-    std.debug.print("\x1b[2J\x1b[H", .{});
     const tty_settings = try hide_input();
     while (move != '\n') {
         //clear
-        std.debug.print("\x1b[2J\x1b[H", .{});
-        try inr.discardAll(inr.bufferedLen());
-        std.debug.print("select account:\n", .{});
+        try output.print("\x1b[2J\x1b[H", .{});
+        try output.print("select account:\n", .{});
 
-        for (account_list.items, 0..) |account, i| {
+        for (list.items, 0..) |account, i| {
             sign = if (selected == i) symbols.arrow else symbols.empty;
-            std.debug.print("{s} {s}\n", .{ sign, account });
+            try output.print("{s} {s}\n", .{ sign, account });
         }
-        move = (try inr.take(1))[0];
+        try output.flush();
+
+        try input.discardAll(input.bufferedLen());
+        move = (try input.take(1))[0];
         selected = switch (move) {
             'j' => if (selected < account_num - 1) selected + 1 else 0,
             'k' => if (selected > 0) selected - 1 else account_num - 1,
@@ -142,7 +140,7 @@ fn selectUser(
     }
 
     try show_input(tty_settings);
-    return account_list.items[selected];
+    return list.items[selected];
 }
 
 fn saslNegotioation(
@@ -626,10 +624,12 @@ fn run(
     conn: *Connection,
 ) !void {
     var input_buff: [1024]u8 = undefined;
+    var output_buff: [1024]u8 = undefined;
 
     var conn_reader = conn.tls.reader(&conn.tls_rbuf);
     var conn_writer = conn.tls.writer(&conn.tls_wbuf);
     var input_reader = std.fs.File.stdin().reader(&input_buff);
+    var output_writer = std.fs.File.stdout().writer(&output_buff);
 
     //roster
     try conn_writer.interface.writeAll(try xmpp.Stanzas.Iq.formatIq(
@@ -650,7 +650,11 @@ fn run(
     var roster_jids = try getRosterJids(allocator, roster_src);
     defer roster_jids.deinit(allocator);
 
-    const chat_jid = try selectUser(&roster_jids);
+    const chat_jid = try selectFromList(
+        &roster_jids,
+        &input_reader.interface,
+        &output_writer.interface,
+    );
 
     const log_file = blk: {
         const log_dir = "log";
@@ -956,13 +960,20 @@ fn start(
     port: u16,
 ) !Connection {
     var input_buff: [1024]u8 = undefined;
+    var output_buff: [1024]u8 = undefined;
+
     var input_reader = std.fs.File.stdin().reader(&input_buff);
+    var output_writer = std.fs.File.stdout().writer(&output_buff);
 
     const account_file_name: []const u8 = "accounts.md";
     var account_list = try getAccountList(allocator, account_file_name);
     defer account_list.deinit();
 
-    const jid = try selectUser(&account_list.list);
+    const jid = try selectFromList(
+        &account_list.list,
+        &input_reader.interface,
+        &output_writer.interface,
+    );
     const at = std.mem.indexOfScalar(u8, jid, '@').?;
 
     const username = jid[0..at];
