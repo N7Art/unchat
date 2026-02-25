@@ -1,7 +1,9 @@
 const std = @import("std");
-const unchat = @import("unchat");
 const tls = @import("tls");
 const xmpp = @import("xmpp.zig");
+
+const Messages = @import("root.zig").Messages;
+const dysplay = @import("output.zig").dysplay;
 
 const Connection = struct {
     tcp: std.net.Stream,
@@ -72,36 +74,6 @@ fn listenToMessages(
     }
 }
 
-fn dysplay(messages: Messages) void {
-    //clear dysplay
-    std.debug.print("\x1b[2J\x1b[H", .{});
-    //dump log in stdout
-    for (messages.indxs.items) |index| {
-        std.debug.print("{d} {s}\n\t{s}\n", .{
-            index,
-            messages.senders.items[index],
-            messages.contents.items[index],
-        });
-    }
-    //input field to stdout
-    std.debug.print("\n---------------------\n|", .{});
-}
-
-test dysplay {
-    const allocator = std.testing.allocator;
-    var msgs: Messages = try .init(allocator, .{
-        .content = @constCast("c0"),
-        .sender = @constCast("s0"),
-        .recipient = @constCast("r0"),
-    });
-    try msgs.append(allocator, .{
-        .content = "asfdasdfasdf",
-        .recipient = "me",
-        .sender = "somebody",
-    });
-    defer msgs.deinit(allocator);
-    dysplay(msgs);
-}
 
 fn getCommandString(
     buf: []u8,
@@ -143,13 +115,13 @@ fn getCommandString(
     return buf[0..i];
 }
 test getCommandString {
-    var dummy_wbuf:[1024]u8 = undefined;
+    var dummy_wbuf: [1024]u8 = undefined;
     var dummy_out = std.Io.Writer.fixed(&dummy_wbuf);
     const test_string = "res0\x7fres1\nno";
     var rdr = std.Io.Reader.fixed(test_string);
 
     // testing backspace and enter
-    var buf:[1024]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     const res = try getCommandString(&buf, &rdr, &dummy_out);
 
     try std.testing.expectEqualStrings("resr", res[0..4]);
@@ -158,11 +130,10 @@ test getCommandString {
     // testing escape
     const test_string1 = test_string[0..3] ++ "\x1b" ++ test_string[3..];
     var rdr1 = std.Io.Reader.fixed(test_string1);
-    var buf1:[1024]u8 = undefined;
+    var buf1: [1024]u8 = undefined;
     const res1 = try getCommandString(&buf1, &rdr1, &dummy_out);
 
     try std.testing.expectEqualStrings("", res1);
-
 }
 
 fn selectFromList(
@@ -429,88 +400,6 @@ test getTagContent {
     try std.testing.expectEqualStrings("string 0", res);
 }
 
-const Messages = struct {
-    indxs: std.ArrayList(usize),
-    ids: std.ArrayList(usize),
-
-    senders: std.ArrayList([]const u8),
-    recipients: std.ArrayList([]const u8),
-    contents: std.ArrayList([]const u8),
-
-    pub const empty: Messages = .{
-        .ids = .empty,
-        .indxs = .empty,
-        .contents = .empty,
-        .senders = .empty,
-        .recipients = .empty,
-    };
-
-    pub fn init(allocator: std.mem.Allocator, message: Message) !Messages {
-        var tmp: Messages = .empty;
-        try tmp.append(allocator, message);
-        return tmp;
-    }
-
-    pub fn deinit(self: *Messages, allocator: std.mem.Allocator) void {
-        self.indxs.deinit(allocator);
-        self.ids.deinit(allocator);
-        self.senders.deinit(allocator);
-        self.recipients.deinit(allocator);
-        self.contents.deinit(allocator);
-    }
-
-    pub const Message = struct {
-        sender: []const u8,
-        recipient: []const u8,
-        content: []const u8,
-    };
-
-    pub fn getMessage(self: Messages, indx: usize) Message {
-        const data_indx = self.indxs.items[indx];
-        return .{
-            .sender = self.senders.items[data_indx],
-            .recipient = self.recipients.items[data_indx],
-            .content = self.contents.items[data_indx],
-        };
-    }
-
-    pub fn append(self: *Messages, allocator: std.mem.Allocator, message: Message) !void {
-        const rec_len = self.recipients.items.len;
-        const sen_len = self.senders.items.len;
-        const con_len = self.contents.items.len;
-        std.debug.assert(rec_len == sen_len and rec_len == con_len and sen_len == con_len);
-
-        const is_full: bool = rec_len == self.ids.items.len and
-            sen_len == self.ids.items.len and
-            con_len == self.ids.items.len;
-
-        if (is_full) {
-            try self.indxs.append(allocator, self.indxs.items.len);
-            try self.ids.append(allocator, self.ids.items.len);
-        }
-
-        try self.senders.append(allocator, message.sender);
-        try self.recipients.append(allocator, message.recipient);
-        try self.contents.append(allocator, message.content);
-    }
-
-    pub fn remove(self: *Messages, indx: usize) !void {
-        const element_indx = self.indxs.items[indx];
-        _ = self.contents.swapRemove(element_indx);
-        _ = self.recipients.swapRemove(element_indx);
-        _ = self.senders.swapRemove(element_indx);
-
-        //swap in id
-        const id_last = self.ids.items.len - 1;
-        const tmp = self.ids.items[id_last];
-        self.ids.items[id_last] = self.ids.items[element_indx];
-        self.ids.items[element_indx] = tmp;
-
-        //update in indx
-        self.indxs.items[indx] = self.ids.items[indx];
-        self.indxs.items[self.indxs.items.len - 1] = self.ids.items[id_last];
-    }
-};
 test "Messages.append" {
     var messages: Messages = .empty;
     defer messages.deinit(std.testing.allocator);
