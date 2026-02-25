@@ -103,8 +103,70 @@ test dysplay {
     dysplay(msgs);
 }
 
+fn getCommandString(
+    buf: []u8,
+    input: *std.Io.Reader,
+    output: *std.Io.Writer,
+) ![]const u8 {
+    try output.print(":", .{});
+    try output.flush();
+
+    var i: u8 = 0;
+    while (true) {
+        const char = try input.takeByte();
+        if (i >= buf.len) i = 0;
+        switch (char) {
+            //enter  esc
+            '\n' => break,
+            //esc
+            27 => {
+                i = 0;
+                break;
+            },
+            //backspace
+            127 => {
+                if (i > 0) {
+                    i -= 1;
+                    try output.print("\x1b[D \x1b[D", .{});
+                    try output.flush();
+                } else i = 0;
+            },
+
+            else => {
+                buf[i] = char;
+                i += 1;
+                try output.print("{c}", .{char});
+                try output.flush();
+            },
+        }
+    }
+    return buf[0..i];
+}
+test getCommandString {
+    var dummy_wbuf:[1024]u8 = undefined;
+    var dummy_out = std.Io.Writer.fixed(&dummy_wbuf);
+    const test_string = "res0\x7fres1\nno";
+    var rdr = std.Io.Reader.fixed(test_string);
+
+    // testing backspace and enter
+    var buf:[1024]u8 = undefined;
+    const res = try getCommandString(&buf, &rdr, &dummy_out);
+
+    try std.testing.expectEqualStrings("resr", res[0..4]);
+    try std.testing.expectEqualStrings("res1", res[3..]);
+
+    // testing escape
+    const test_string1 = test_string[0..3] ++ "\x1b" ++ test_string[3..];
+    var rdr1 = std.Io.Reader.fixed(test_string1);
+    var buf1:[1024]u8 = undefined;
+    const res1 = try getCommandString(&buf1, &rdr1, &dummy_out);
+
+    try std.testing.expectEqualStrings("", res1);
+
+}
+
 fn selectFromList(
-    list: *std.ArrayList([]const u8),
+    list: std.ArrayList([]const u8),
     input: *std.Io.Reader,
     output: *std.Io.Writer,
 ) ![]const u8 {
@@ -132,6 +194,10 @@ fn selectFromList(
 
         try input.discardAll(input.bufferedLen());
         move = (try input.take(1))[0];
+        if (move == ':') {
+            var buf: [1024]u8 = undefined;
+            _ = try getCommandString(&buf, input, output);
+        }
         selected = switch (move) {
             'j' => if (selected < account_num - 1) selected + 1 else 0,
             'k' => if (selected > 0) selected - 1 else account_num - 1,
@@ -651,7 +717,7 @@ fn run(
     defer roster_jids.deinit(allocator);
 
     const chat_jid = try selectFromList(
-        &roster_jids,
+        roster_jids,
         &input_reader.interface,
         &output_writer.interface,
     );
@@ -970,7 +1036,7 @@ fn start(
     defer account_list.deinit();
 
     const jid = try selectFromList(
-        &account_list.list,
+        account_list.list,
         &input_reader.interface,
         &output_writer.interface,
     );
