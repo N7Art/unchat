@@ -1,7 +1,7 @@
 const std = @import("std");
 const unchat = @import("unchat");
 const tls = @import("tls");
-const xmpp = unchat.Xmpp;
+const xmpp = @import("xmpp.zig");
 
 const Connection = struct {
     tcp: std.net.Stream,
