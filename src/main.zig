@@ -5,6 +5,12 @@ const xmpp = @import("xmpp.zig");
 const Messages = @import("root.zig").Messages;
 const dysplay = @import("output.zig").dysplay;
 
+const Command = enum {
+    help,
+    quit,
+    unknown,
+};
+
 const Connection = struct {
     tcp: std.net.Stream,
     tls: tls.Connection,
@@ -74,7 +80,6 @@ fn listenToMessages(
     }
 }
 
-
 fn getCommandString(
     buf: []u8,
     input: *std.Io.Reader,
@@ -134,6 +139,76 @@ test getCommandString {
     const res1 = try getCommandString(&buf1, &rdr1, &dummy_out);
 
     try std.testing.expectEqualStrings("", res1);
+}
+
+fn parseCommandString(
+    allocator: std.mem.Allocator,
+    string: []const u8,
+) !struct {
+    allocator: std.mem.Allocator,
+    command: Command,
+    args: std.ArrayList([]const u8),
+    pub fn deinit(self: *@This()) void {
+        self.args.deinit(self.allocator);
+    }
+} {
+    var iterator = std.mem.splitScalar(u8, string, ' ');
+    var command: Command = undefined;
+    command = blk: {
+        if (iterator.next()) |value| {
+            if (std.mem.eql(u8, value, "help") or
+                std.mem.eql(u8, value, "h"))
+                break :blk .help;
+
+            if (std.mem.eql(u8, value, "quit") or
+                std.mem.eql(u8, value, "q"))
+                break :blk .quit;
+        }
+        break :blk .unknown;
+    };
+    var args: std.ArrayList([]const u8) = .empty;
+    while (iterator.next()) |value| {
+        try args.append(allocator, value);
+    }
+    return .{
+        .allocator = allocator,
+        .command = command,
+        .args = args,
+    };
+}
+
+test parseCommandString {
+    const allocator = std.testing.allocator;
+    const strings = "help a b c|h a b c||";
+    var str_it = std.mem.splitScalar(u8, strings, '|');
+
+    try std.testing.expectEqual(
+        Command.help,
+        blk: {
+            var ret = try parseCommandString(allocator, str_it.next().?);
+            const res = ret.command;
+            ret.deinit();
+            break :blk res;
+        },
+    );
+    try std.testing.expectEqual(
+        Command.help,
+        blk: {
+            var ret = try parseCommandString(allocator, str_it.next().?);
+            const res = ret.command;
+            ret.deinit();
+            break :blk res;
+        },
+    );
+    try std.testing.expectEqual(
+        Command.unknown,
+        blk: {
+            var ret = try parseCommandString(allocator, str_it.next().?);
+            const res = ret.command;
+            ret.deinit();
+            break :blk res;
+        },
+    );
 }
 
 fn selectFromList(
