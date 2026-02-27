@@ -2,14 +2,10 @@ const std = @import("std");
 const tls = @import("tls");
 const xmpp = @import("xmpp.zig");
 
+const CommandLine = @import("commandline.zig");
 const Messages = @import("root.zig").Messages;
-const dysplay = @import("output.zig").dysplay;
 
-const Command = enum {
-    help,
-    quit,
-    unknown,
-};
+const dysplay = @import("output.zig").dysplay;
 
 const Connection = struct {
     tcp: std.net.Stream,
@@ -80,137 +76,8 @@ fn listenToMessages(
     }
 }
 
-fn getCommandString(
-    buf: []u8,
-    input: *std.Io.Reader,
-    output: *std.Io.Writer,
-) ![]const u8 {
-    try output.print(":", .{});
-    try output.flush();
-
-    var i: u8 = 0;
-    while (true) {
-        const char = try input.takeByte();
-        if (i >= buf.len) i = 0;
-        switch (char) {
-            //enter  esc
-            '\n' => break,
-            //esc
-            27 => {
-                i = 0;
-                break;
-            },
-            //backspace
-            127 => {
-                if (i > 0) {
-                    i -= 1;
-                    try output.print("\x1b[D \x1b[D", .{});
-                    try output.flush();
-                } else i = 0;
-            },
-
-            else => {
-                buf[i] = char;
-                i += 1;
-                try output.print("{c}", .{char});
-                try output.flush();
-            },
-        }
-    }
-    return buf[0..i];
-}
-test getCommandString {
-    var dummy_wbuf: [1024]u8 = undefined;
-    var dummy_out = std.Io.Writer.fixed(&dummy_wbuf);
-    const test_string = "res0\x7fres1\nno";
-    var rdr = std.Io.Reader.fixed(test_string);
-
-    // testing backspace and enter
-    var buf: [1024]u8 = undefined;
-    const res = try getCommandString(&buf, &rdr, &dummy_out);
-
-    try std.testing.expectEqualStrings("resr", res[0..4]);
-    try std.testing.expectEqualStrings("res1", res[3..]);
-
-    // testing escape
-    const test_string1 = test_string[0..3] ++ "\x1b" ++ test_string[3..];
-    var rdr1 = std.Io.Reader.fixed(test_string1);
-    var buf1: [1024]u8 = undefined;
-    const res1 = try getCommandString(&buf1, &rdr1, &dummy_out);
-
-    try std.testing.expectEqualStrings("", res1);
-}
-
-fn parseCommandString(
-    allocator: std.mem.Allocator,
-    string: []const u8,
-) !struct {
-    allocator: std.mem.Allocator,
-    command: Command,
-    args: std.ArrayList([]const u8),
-    pub fn deinit(self: *@This()) void {
-        self.args.deinit(self.allocator);
-    }
-} {
-    var iterator = std.mem.splitScalar(u8, string, ' ');
-    const command: Command  = blk: {
-        if (iterator.next()) |value| {
-            if (std.mem.eql(u8, value, "help") or
-                std.mem.eql(u8, value, "h"))
-                break :blk .help;
-
-            if (std.mem.eql(u8, value, "quit") or
-                std.mem.eql(u8, value, "q"))
-                break :blk .quit;
-        }
-        break :blk .unknown;
-    };
-    var args: std.ArrayList([]const u8) = .empty;
-    while (iterator.next()) |value| {
-        try args.append(allocator, value);
-    }
-    return .{
-        .allocator = allocator,
-        .command = command,
-        .args = args,
-    };
-}
-
-test parseCommandString {
-    const allocator = std.testing.allocator;
-    const strings = "help a b c|h a b c||";
-    var str_it = std.mem.splitScalar(u8, strings, '|');
-
-    try std.testing.expectEqual(
-        Command.help,
-        blk: {
-            var ret = try parseCommandString(allocator, str_it.next().?);
-            const res = ret.command;
-            ret.deinit();
-            break :blk res;
-        },
-    );
-    try std.testing.expectEqual(
-        Command.help,
-        blk: {
-            var ret = try parseCommandString(allocator, str_it.next().?);
-            const res = ret.command;
-            ret.deinit();
-            break :blk res;
-        },
-    );
-    try std.testing.expectEqual(
-        Command.unknown,
-        blk: {
-            var ret = try parseCommandString(allocator, str_it.next().?);
-            const res = ret.command;
-            ret.deinit();
-            break :blk res;
-        },
-    );
-}
-
 fn selectFromList(
+    allocator: std.mem.Allocator,
     list: std.ArrayList([]const u8),
     input: *std.Io.Reader,
     output: *std.Io.Writer,
@@ -225,6 +92,10 @@ fn selectFromList(
     var move: u8 = undefined;
     var sign: []u8 = symbols.arrow;
 
+    var buf: [1024]u8 = undefined;
+    var commandline: CommandLine = .init(allocator, &buf, input, output);
+    defer commandline.deinit();
+
     const tty_settings = try hide_input();
     while (move != '\n') {
         //clear
@@ -238,10 +109,9 @@ fn selectFromList(
         try output.flush();
 
         try input.discardAll(input.bufferedLen());
-        move = (try input.take(1))[0];
+        move = try input.takeByte();
         if (move == ':') {
-            var buf: [1024]u8 = undefined;
-            _ = try getCommandString(&buf, input, output);
+            try commandline.spawn();
         }
         selected = switch (move) {
             'j' => if (selected < account_num - 1) selected + 1 else 0,
@@ -680,6 +550,7 @@ fn run(
     defer roster_jids.deinit(allocator);
 
     const chat_jid = try selectFromList(
+        allocator,
         roster_jids,
         &input_reader.interface,
         &output_writer.interface,
@@ -999,6 +870,7 @@ fn start(
     defer account_list.deinit();
 
     const jid = try selectFromList(
+        allocator,
         account_list.list,
         &input_reader.interface,
         &output_writer.interface,
@@ -1038,10 +910,13 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var conn = try start(
+    var conn = start(
         allocator,
         port,
-    );
+    ) catch |err| switch (err) {
+        error.Quit => return,
+        else => return err,
+    };
 
     try run(allocator, &conn);
 }
