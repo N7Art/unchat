@@ -153,8 +153,7 @@ fn parseCommandString(
     }
 } {
     var iterator = std.mem.splitScalar(u8, string, ' ');
-    var command: Command = undefined;
-    command = blk: {
+    const command: Command  = blk: {
         if (iterator.next()) |value| {
             if (std.mem.eql(u8, value, "help") or
                 std.mem.eql(u8, value, "h"))
